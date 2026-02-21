@@ -1,245 +1,175 @@
+%%%-------------------------------------------------------------------
+%%% @doc GitHub API search filter.
+%%%
+%%% Searches GitHub repositories, code, issues, and users matching
+%%% the query and returns them as embryo maps.
+%%% Uses GITHUB_API env var as Bearer token if available.
+%%% @end
+%%%-------------------------------------------------------------------
 -module(github_api_filter_app).
 -behaviour(application).
 
-%% Application callbacks
 -export([start/2, stop/1]).
-
-%% Handler callbacks
 -export([handle/1]).
 
 -define(GITHUB_API_URL, "https://api.github.com/search/").
 
-%% Application behavior
+%%====================================================================
+%% Application behaviour
+%%====================================================================
+
 start(_StartType, _StartArgs) ->
-    {ok, Port} = em_filter:find_port(),
-    em_filter_sup:start_link(github_filter, ?MODULE, Port).
+    em_filter:start_filter(github_filter, ?MODULE).
 
 stop(_State) ->
-    ok.
+    em_filter:stop_filter(github_filter).
 
-%% @doc Handle incoming requests from the filter server.
-%% This function is called by em_filter_server through Wade.
-%% @param Body The request body (JSON binary or string)
-%% @return JSON response as binary or string
+%%====================================================================
+%% Filter handler — returns a list of embryo maps
+%%====================================================================
+
 handle(Body) when is_binary(Body) ->
-    handle(binary_to_list(Body));
-
-handle(Body) when is_list(Body) ->
-    EmbryoList = generate_embryo_list(list_to_binary(Body)),
-    Response = #{embryo_list => EmbryoList},
-    jsone:encode(Response);
-
+    generate_embryo_list(Body);
 handle(_) ->
-    jsone:encode(#{error => <<"Invalid request body">>}).
+    [].
+
+%%====================================================================
+%% Search and processing
+%%====================================================================
 
 generate_embryo_list(JsonBinary) ->
-    case jsone:decode(JsonBinary, [{keys, atom}]) of
-        Search when is_map(Search) ->
-            Value = binary_to_list(maps:get(value, Search, <<"">>)),
-            Timeout = list_to_integer(binary_to_list(maps:get(timeout, Search, <<"10">>))),
+    {Value, Timeout} = extract_params(JsonBinary),
+    Types     = ["repositories", "code", "issues", "users"],
+    StartTime = erlang:system_time(millisecond),
+    search_all_types(Types, Value, StartTime, Timeout * 1000, []).
 
-            %% Chercher dans tous les types de ressources GitHub
-            SearchTypes = ["repositories", "code", "issues", "users"],
-            
-            StartTime = erlang:system_time(millisecond),
-            TimeoutMs = Timeout * 1000,
-            
-            search_all_types(SearchTypes, Value, StartTime, TimeoutMs, []);
-        {error, Reason} ->
-            io:format("Error decoding JSON: ~p~n", [Reason]),
-            []
+extract_params(JsonBinary) ->
+    try json:decode(JsonBinary) of
+        Map when is_map(Map) ->
+            Value   = binary_to_list(maps:get(<<"value">>,   Map, <<"">>)),
+            Timeout = case maps:get(<<"timeout">>, Map, undefined) of
+                undefined            -> 10;
+                T when is_integer(T) -> T;
+                T when is_binary(T)  -> binary_to_integer(T)
+            end,
+            {Value, Timeout};
+        _ ->
+            {binary_to_list(JsonBinary), 10}
+    catch
+        _:_ -> {binary_to_list(JsonBinary), 10}
     end.
 
-search_all_types([], _Query, _StartTime, _Timeout, Acc) ->
+search_all_types([], _Query, _Start, _Timeout, Acc) ->
     lists:reverse(Acc);
-search_all_types([Type | Rest], Query, StartTime, Timeout, Acc) ->
-    CurrentTime = erlang:system_time(millisecond),
-    case CurrentTime - StartTime >= Timeout of
-        true ->
-            lists:reverse(Acc);
+search_all_types([Type | Rest], Query, Start, Timeout, Acc) ->
+    case erlang:system_time(millisecond) - Start >= Timeout of
+        true  -> lists:reverse(Acc);
         false ->
             Results = search_github_type(Type, Query, Timeout div 1000),
-            search_all_types(Rest, Query, StartTime, Timeout, Results ++ Acc)
+            search_all_types(Rest, Query, Start, Timeout, Results ++ Acc)
     end.
 
 search_github_type(Type, Query, TimeoutSecs) ->
-    EncodedQuery = uri_string:quote(Query),
-    Url = lists:concat([?GITHUB_API_URL, Type, "?q=", EncodedQuery, "&per_page=30"]),
-    
+    Url     = lists:concat([?GITHUB_API_URL, Type,
+                             "?q=", uri_string:quote(Query), "&per_page=30"]),
     Headers = build_headers(),
-    
-    case httpc:request(get, {Url, Headers}, [{timeout, TimeoutSecs * 1000}], [{body_format, binary}]) of
+    case httpc:request(get, {Url, Headers},
+                       [{timeout, TimeoutSecs * 1000}],
+                       [{body_format, binary}]) of
         {ok, {{_, 200, _}, _, Body}} ->
-            extract_items_from_response(Body, Type);
-        {ok, {{_, StatusCode, _}, _, _}} when StatusCode == 401; StatusCode == 403 ->
-            %% Authentication required or rate limited, skip silently
-            [];
-        {ok, {{_, StatusCode, _}, _, Body}} ->
-            io:format("GitHub API returned status ~p for ~s: ~p~n", [StatusCode, Type, Body]),
-            [];
-        {error, Reason} ->
-            io:format("Error fetching ~s results: ~p~n", [Type, Reason]),
+            parse_response(Body, Type);
+        _ ->
             []
     end.
 
 build_headers() ->
-    BaseHeaders = [
-        {"User-Agent", "Emergence-GitHub-Filter"},
-        {"Accept", "application/vnd.github+json"},
-        {"X-GitHub-Api-Version", "2022-11-28"}
-    ],
-    
+    Base = [{"User-Agent",           "Emergence-GitHub-Filter"},
+            {"Accept",               "application/vnd.github+json"},
+            {"X-GitHub-Api-Version", "2022-11-28"}],
     case os:getenv("GITHUB_API") of
-        false ->
-            BaseHeaders;
-        ApiKey ->
-            [{"Authorization", "Bearer " ++ ApiKey} | BaseHeaders]
+        false  -> Base;
+        ApiKey -> [{"Authorization", "Bearer " ++ ApiKey} | Base]
     end.
 
-extract_items_from_response(JsonData, Type) ->
-    try jsone:decode(JsonData) of
-        ParsedJson ->
-            case maps:get(<<"items">>, ParsedJson, undefined) of
-                Items when is_list(Items) ->
-                    lists:filtermap(
-                        fun(Item) -> process_item(Item, Type) end,
-                        Items
-                    );
-                _ ->
-                    []
-            end
+%%--------------------------------------------------------------------
+%% Response parsing
+%%--------------------------------------------------------------------
+
+parse_response(JsonData, Type) ->
+    try json:decode(JsonData) of
+        #{<<"items">> := Items} when is_list(Items) ->
+            lists:filtermap(fun(Item) -> process_item(Item, Type) end, Items);
+        _ -> []
     catch
-        error:Reason ->
-            io:format("Failed to parse JSON response for ~s: ~p~n", [Type, Reason]),
-            []
+        _:_ -> []
     end.
 
 process_item(Item, "repositories") ->
-    try
-        Url = maps:get(<<"html_url">>, Item, undefined),
-        Name = maps:get(<<"full_name">>, Item, undefined),
-        
-        case {Url, Name} of
-            {U, N} when is_binary(U), is_binary(N) ->
-                %% Gérer description qui peut être null
-                Desc = maps:get(<<"description">>, Item, undefined),
-                
-                Resume = case Desc of
-                    DescBin when is_binary(DescBin) ->
-                        <<N/binary, " - ", DescBin/binary>>;
-                    _ ->
-                        N
-                end,
-                
-                %% Gérer les cas où stargazers_count ou language peuvent être null
-                Stars = case maps:get(<<"stargazers_count">>, Item, 0) of
-                    Num when is_integer(Num) -> Num;
-                    _ -> 0
-                end,
-                
-                Language = case maps:get(<<"language">>, Item, <<"Unknown">>) of
-                    L when is_binary(L) -> L;
-                    _ -> <<"Unknown">>
-                end,
-                
-                %% Convertir Resume en liste pour io_lib:format
-                ResumeStr = binary_to_list(Resume),
-                LanguageStr = binary_to_list(Language),
-                
-                Formatted = io_lib:format("~ts [⭐ ~p | ~ts]", [ResumeStr, Stars, LanguageStr]),
-                FullResume = unicode:characters_to_binary(Formatted),
-                
-                {true, #{
-                    properties => #{
-                        <<"url">> => U,
-                        <<"resume">> => FullResume,
-                        <<"type">> => <<"repository">>
-                    }
-                }};
-            _ ->
-                false
-        end
-    catch
-        Error:Reason:_Stack ->
-            io:format("Error processing repository: ~p:~p~n", [Error, Reason]),
-            false
+    case {maps:get(<<"html_url">>,    Item, undefined),
+          maps:get(<<"full_name">>,   Item, undefined)} of
+        {Url, Name} when is_binary(Url), is_binary(Name) ->
+            Desc  = case maps:get(<<"description">>, Item, undefined) of
+                D when is_binary(D) -> <<Name/binary, " - ", D/binary>>;
+                _                   -> Name
+            end,
+            Stars = case maps:get(<<"stargazers_count">>, Item, 0) of
+                N when is_integer(N) -> N;
+                _                    -> 0
+            end,
+            Lang  = case maps:get(<<"language">>, Item, <<"Unknown">>) of
+                L when is_binary(L) -> L;
+                _                   -> <<"Unknown">>
+            end,
+            Resume = unicode:characters_to_binary(
+                io_lib:format("~ts [⭐ ~p | ~ts]",
+                    [binary_to_list(Desc), Stars, binary_to_list(Lang)])),
+            {true, embryo(Url, Resume)};
+        _ -> false
     end;
 
 process_item(Item, "code") ->
     case {maps:get(<<"html_url">>, Item, undefined),
-          maps:get(<<"name">>, Item, undefined),
-          maps:get(<<"path">>, Item, undefined)} of
-        {Url, Name, Path} when is_binary(Url), is_binary(Name), is_binary(Path) ->
+          maps:get(<<"path">>,     Item, undefined)} of
+        {Url, Path} when is_binary(Url), is_binary(Path) ->
             Repo = case maps:get(<<"repository">>, Item, undefined) of
-                RepoMap when is_map(RepoMap) ->
-                    maps:get(<<"full_name">>, RepoMap, <<"Unknown">>);
-                _ ->
-                    <<"Unknown">>
+                R when is_map(R) -> maps:get(<<"full_name">>, R, <<"Unknown">>);
+                _                -> <<"Unknown">>
             end,
-            
             Resume = <<Path/binary, " in ", Repo/binary>>,
-            
-            {true, #{
-                properties => #{
-                    <<"url">> => Url,
-                    <<"resume">> => Resume,
-                    <<"type">> => <<"code">>
-                }
-            }};
-        _ ->
-            false
+            {true, embryo(Url, Resume)};
+        _ -> false
     end;
 
 process_item(Item, "issues") ->
     case {maps:get(<<"html_url">>, Item, undefined),
-          maps:get(<<"title">>, Item, undefined)} of
+          maps:get(<<"title">>,    Item, undefined)} of
         {Url, Title} when is_binary(Url), is_binary(Title) ->
-            Number = maps:get(<<"number">>, Item, 0),
-            State = maps:get(<<"state">>, Item, <<"unknown">>),
-            
+            Number  = maps:get(<<"number">>, Item, 0),
+            State   = maps:get(<<"state">>,  Item, <<"unknown">>),
             RepoUrl = maps:get(<<"repository_url">>, Item, <<"">>),
-            RepoName = extract_repo_name(RepoUrl),
-            
-            ResumeStr = io_lib:format("#~p: ~ts [~ts] - ~ts", 
-                                     [Number, binary_to_list(Title), 
-                                      binary_to_list(State), binary_to_list(RepoName)]),
-            Resume = unicode:characters_to_binary(ResumeStr),
-            
-            {true, #{
-                properties => #{
-                    <<"url">> => Url,
-                    <<"resume">> => Resume,
-                    <<"type">> => <<"issue">>
-                }
-            }};
-        _ ->
-            false
+            Repo    = extract_repo_name(RepoUrl),
+            Resume  = unicode:characters_to_binary(
+                io_lib:format("#~p: ~ts [~ts] - ~ts",
+                    [Number, binary_to_list(Title),
+                     binary_to_list(State), binary_to_list(Repo)])),
+            {true, embryo(Url, Resume)};
+        _ -> false
     end;
 
 process_item(Item, "users") ->
     case {maps:get(<<"html_url">>, Item, undefined),
-          maps:get(<<"login">>, Item, undefined)} of
+          maps:get(<<"login">>,    Item, undefined)} of
         {Url, Login} when is_binary(Url), is_binary(Login) ->
-            Type = maps:get(<<"type">>, Item, <<"User">>),
-            
+            Type   = maps:get(<<"type">>, Item, <<"User">>),
             Resume = <<Login/binary, " (", Type/binary, ")">>,
-            
-            {true, #{
-                properties => #{
-                    <<"url">> => Url,
-                    <<"resume">> => Resume,
-                    <<"type">> => <<"user">>
-                }
-            }};
-        _ ->
-            false
+            {true, embryo(Url, Resume)};
+        _ -> false
     end;
 
-process_item(_, _) ->
-    false.
+process_item(_, _) -> false.
 
-%% Helper to extract repository name from repository_url
-extract_repo_name(<<"https://api.github.com/repos/", Rest/binary>>) ->
-    Rest;
-extract_repo_name(_) ->
-    <<"Unknown">>.
+embryo(Url, Resume) ->
+    #{<<"properties">> => #{<<"url">> => Url, <<"resume">> => Resume}}.
+
+extract_repo_name(<<"https://api.github.com/repos/", Rest/binary>>) -> Rest;
+extract_repo_name(_) -> <<"Unknown">>.
