@@ -5,13 +5,11 @@
 %%% the query and returns them as embryo maps.
 %%% Uses GITHUB_API env var as Bearer token if available.
 %%%
-%%% As an agent this module:
-%%%   - Announces capabilities to em_disco on startup via `agent_hello'.
-%%%   - Maintains a memory of URLs already returned, so duplicate
-%%%     results across successive queries are filtered out.
+%%% Announces capabilities to em_disco on startup and maintains a
+%%% memory of URLs already returned so duplicates across successive
+%%% queries are filtered out.
 %%%
 %%% Handler contract: `handle/2' (Body, Memory) -> {RawList, NewMemory}.
-%%% Returns a raw Erlang list — em_filter_server encodes it.
 %%% Memory schema: `#{seen => #{binary_url => true}}'.
 %%% @end
 %%%-------------------------------------------------------------------
@@ -19,7 +17,7 @@
 -behaviour(application).
 
 -export([start/2, stop/1]).
--export([handle/1, handle/2]).
+-export([handle/2]).
 
 -define(GITHUB_API_URL, "https://api.github.com/search/").
 
@@ -43,50 +41,26 @@ start(_StartType, _StartArgs) ->
     }).
 
 stop(_State) ->
-    em_filter:stop_filter(github_filter).
+    em_filter:stop_agent(github_filter).
 
 %%====================================================================
-%% Agent handler — with memory (primary path)
-%%
-%% Memory holds the set of URLs already returned to the client.
-%% New results are filtered against this set before being returned,
-%% then the set is updated with the fresh URLs.
-%%
-%% Returns a raw list of embryo maps — NOT pre-encoded JSON.
-%% em_filter_server wraps and encodes the result.
+%% Agent handler
 %%====================================================================
 
 handle(Body, Memory) when is_binary(Body) ->
     Seen    = maps:get(seen, Memory, #{}),
     Embryos = generate_embryo_list(Body),
-
-    %% Filter out URLs the agent has already returned in a previous query.
-    Fresh = [E || E <- Embryos,
-                  not maps:is_key(url_of(E), Seen)],
-
-    %% Accumulate newly seen URLs into memory.
+    Fresh   = [E || E <- Embryos, not maps:is_key(url_of(E), Seen)],
     NewSeen = lists:foldl(fun(E, Acc) ->
         Acc#{url_of(E) => true}
     end, Seen, Fresh),
-
     {Fresh, Memory#{seen => NewSeen}};
 
 handle(_Body, Memory) ->
     {[], Memory}.
 
 %%====================================================================
-%% Plain filter handler — kept for backward compatibility.
-%% Called when the agent is started without memory (handle/1 path).
-%% Returns a raw list — em_filter_server encodes it.
-%%====================================================================
-
-handle(Body) when is_binary(Body) ->
-    generate_embryo_list(Body);
-handle(_) ->
-    [].
-
-%%====================================================================
-%% Search and processing (unchanged)
+%% Search and processing
 %%====================================================================
 
 generate_embryo_list(JsonBinary) ->
@@ -143,10 +117,6 @@ build_headers() ->
         ApiKey -> [{"Authorization", "Bearer " ++ ApiKey} | Base]
     end.
 
-%%--------------------------------------------------------------------
-%% Response parsing (unchanged)
-%%--------------------------------------------------------------------
-
 parse_response(JsonData, Type) ->
     try json:decode(JsonData) of
         #{<<"items">> := Items} when is_list(Items) ->
@@ -157,8 +127,8 @@ parse_response(JsonData, Type) ->
     end.
 
 process_item(Item, "repositories") ->
-    case {maps:get(<<"html_url">>,    Item, undefined),
-          maps:get(<<"full_name">>,   Item, undefined)} of
+    case {maps:get(<<"html_url">>,  Item, undefined),
+          maps:get(<<"full_name">>, Item, undefined)} of
         {Url, Name} when is_binary(Url), is_binary(Name) ->
             Desc  = case maps:get(<<"description">>, Item, undefined) of
                 D when is_binary(D) -> <<Name/binary, " - ", D/binary>>;
@@ -226,11 +196,6 @@ embryo(Url, Resume) ->
 extract_repo_name(<<"https://api.github.com/repos/", Rest/binary>>) -> Rest;
 extract_repo_name(_) -> <<"Unknown">>.
 
-%%====================================================================
-%% Internal helpers
-%%====================================================================
-
-%% Extracts the URL from an embryo map for memory tracking.
 -spec url_of(map()) -> binary().
 url_of(#{<<"properties">> := #{<<"url">> := Url}}) -> Url;
 url_of(_) -> <<>>.
