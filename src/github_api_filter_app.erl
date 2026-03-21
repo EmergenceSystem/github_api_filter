@@ -1,34 +1,35 @@
 %%%-------------------------------------------------------------------
 %%% @doc GitHub API search agent.
 %%%
-%%% Searches GitHub repositories, code, issues, and users matching
+%%% Searches GitHub repositories, code, issues and users matching
 %%% the query and returns them as embryo maps.
 %%% Uses GITHUB_API env var as Bearer token if available.
 %%%
-%%% Announces capabilities to em_disco on startup and maintains a
-%%% memory of URLs already returned so duplicates across successive
-%%% queries are filtered out.
+%%% Deduplication by URL is handled upstream by the Emquest pipeline.
 %%%
-%%% Handler contract: `handle/2' (Body, Memory) -> {RawList, NewMemory}.
-%%% Memory schema: `#{seen => #{binary_url => true}}'.
+%%% === Capability cascade ===
+%%%
+%%%   base_capabilities/0 extends em_filter:base_capabilities().
+%%%
+%%% Handler contract: handle/2 (Body, Memory) -> {RawList, Memory}.
 %%% @end
 %%%-------------------------------------------------------------------
 -module(github_api_filter_app).
 -behaviour(application).
 
 -export([start/2, stop/1]).
--export([handle/2]).
+-export([handle/2, base_capabilities/0]).
 
 -define(GITHUB_API_URL, "https://api.github.com/search/").
 
--define(CAPABILITIES, [
-    <<"github">>,
-    <<"search">>,
-    <<"repositories">>,
-    <<"code">>,
-    <<"issues">>,
-    <<"users">>
-]).
+%%====================================================================
+%% Capability cascade
+%%====================================================================
+
+-spec base_capabilities() -> [binary()].
+base_capabilities() ->
+    em_filter:base_capabilities() ++ [<<"github">>, <<"repositories">>,
+                                      <<"code">>, <<"issues">>, <<"users">>].
 
 %%====================================================================
 %% Application behaviour
@@ -36,9 +37,9 @@
 
 start(_StartType, _StartArgs) ->
     em_filter:start_agent(github_filter, ?MODULE, #{
-        capabilities => ?CAPABILITIES,
-        memory       => ets
-    }).
+        capabilities => base_capabilities()
+    }),
+    {ok, self()}.
 
 stop(_State) ->
     em_filter:stop_agent(github_filter).
@@ -48,14 +49,7 @@ stop(_State) ->
 %%====================================================================
 
 handle(Body, Memory) when is_binary(Body) ->
-    Seen    = maps:get(seen, Memory, #{}),
-    Embryos = generate_embryo_list(Body),
-    Fresh   = [E || E <- Embryos, not maps:is_key(url_of(E), Seen)],
-    NewSeen = lists:foldl(fun(E, Acc) ->
-        Acc#{url_of(E) => true}
-    end, Seen, Fresh),
-    {Fresh, Memory#{seen => NewSeen}};
-
+    {generate_embryo_list(Body), Memory};
 handle(_Body, Memory) ->
     {[], Memory}.
 
@@ -72,7 +66,8 @@ generate_embryo_list(JsonBinary) ->
 extract_params(JsonBinary) ->
     try json:decode(JsonBinary) of
         Map when is_map(Map) ->
-            Value   = binary_to_list(maps:get(<<"value">>,   Map, <<"">>)),
+            Value   = binary_to_list(maps:get(<<"value">>, Map,
+                          maps:get(<<"query">>, Map, <<"">>))),
             Timeout = case maps:get(<<"timeout">>, Map, undefined) of
                 undefined            -> 10;
                 T when is_integer(T) -> T;
@@ -143,7 +138,7 @@ process_item(Item, "repositories") ->
                 _                   -> <<"Unknown">>
             end,
             Resume = unicode:characters_to_binary(
-                io_lib:format("~ts [⭐ ~p | ~ts]",
+                io_lib:format("~ts [~p stars | ~ts]",
                     [binary_to_list(Desc), Stars, binary_to_list(Lang)])),
             {true, embryo(Url, Resume)};
         _ -> false
@@ -195,7 +190,3 @@ embryo(Url, Resume) ->
 
 extract_repo_name(<<"https://api.github.com/repos/", Rest/binary>>) -> Rest;
 extract_repo_name(_) -> <<"Unknown">>.
-
--spec url_of(map()) -> binary().
-url_of(#{<<"properties">> := #{<<"url">> := Url}}) -> Url;
-url_of(_) -> <<>>.
